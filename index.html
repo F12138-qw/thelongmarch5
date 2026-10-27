@@ -1081,7 +1081,7 @@ img,svg,canvas{display:block;max-width:100%;}
 
     <footer class="home-footer">
       <span>重大史实依据公开党史、军史及亲历者回忆 · 支线为据史料改写的教学叙事</span>
-      <span class="footer-right">内置 UI 音效 · 两首背景音乐可在声音设置中查看<br>单文件 Canvas 游戏 · 音乐素材按说明放入 assets/audio</span>
+      <span class="footer-right">两首配乐与全部音效由 Web Audio 实时合成<br>无外部音乐素材 · 单文件 Canvas 游戏</span>
     </footer>
   </div>
 </section>
@@ -1194,6 +1194,7 @@ img,svg,canvas{display:block;max-width:100%;}
 <noscript><div class="noscript">这个沙盘需要启用 JavaScript 才能展开。<br>请在浏览器设置中允许脚本运行。</div></noscript>
 
 <script>
+
 
 'use strict';
 
@@ -4997,7 +4998,7 @@ function showHome() {
 
 function hideHome() {
   ui.homeVisible = false;
-  D.homeScreen.hidden = true;
+ D.homeScreen.hidden = true;
   document.body.classList.remove('home-open');
 }
 function clearAllOverlays() {
@@ -5098,44 +5099,38 @@ function confirmReset() {
 /* =========================================================
    十七点五、声音系统
    ---------------------------------------------------------
-   音效由 Web Audio 实时合成，不需要素材文件。
-   背景音乐读取 assets/audio/ 下的两个本地文件；文件缺失时静音运行。
+   全部音效与两首背景音乐均由 Web Audio 实时合成。
+   不依赖任何外部音乐、音效或图片素材。
    ========================================================= */
-const AUDIO_PREFS_KEY = 'changzheng-sandbox-audio-v1';
-const AUDIO_TRACK_PATHS = {
-  journey: 'assets/audio/bgm-journey.mp3',
-  finale: 'assets/audio/bgm-finale.mp3'
-};
+const AUDIO_PREFS_KEY = 'changzheng-sandbox-audio-v2';
 const MUSIC_CREDITS = {
   journey: {
-    title: '行军途中（待配置）',
-    credit: '请在此登记：曲名 / 作者 / 授权方式 / 来源链接'
+    title: '行军途中（内置合成）',
+    credit: '古筝式拨弦 / 低音持续音 / 轻军鼓 · Web Audio 实时生成'
   },
   finale: {
-    title: '会宁之后（待配置）',
-    credit: '请在此登记：曲名 / 作者 / 授权方式 / 来源链接'
+    title: '会宁之后（内置合成）',
+    credit: '低音弦乐 / 稀疏钢琴 / 远处钟声 · Web Audio 实时生成'
   }
 };
 const CZAudio = (() => {
   const defaults = {
     musicEnabled: true,
     sfxEnabled: true,
-    musicVolume: 0.34,
-    sfxVolume: 0.52
+    musicVolume: 0.44,
+    sfxVolume: 0.5
   };
   let settings = loadSettings();
   let audioContext = null;
   let sfxBus = null;
+  let musicMaster = null;
+  let reverb = null;
   let unlocked = false;
   let scene = 'none';
-  let current = null;
-  let currentName = 'none';
   let ducked = false;
   let pausedByVisibility = false;
   let changeListener = null;
-  const tracks = {};
-  const status = { journey: 'idle', finale: 'idle' };
-  const statusLabels = { idle: '待加载', loading: '加载中', ready: '已就绪', missing: '未找到文件' };
+  let proc = null;
   function loadSettings() {
     try {
       const raw = localStorage.getItem(AUDIO_PREFS_KEY);
@@ -5170,110 +5165,21 @@ const CZAudio = (() => {
     if (!settings.musicEnabled) return 0;
     return clamp(settings.musicVolume * (ducked ? 0.34 : 1), 0, 1);
   }
-  function fade(el, to, ms, pauseAtEnd = false) {
-    if (!el) return;
-    const token = (el.__czFadeToken || 0) + 1;
-    el.__czFadeToken = token;
-    const from = Number(el.volume) || 0;
-    const toValue = clamp(Number(to) || 0, 0, 1);
-    const start = performance.now();
-    const duration = Math.max(30, ms || 0);
-    const step = (now) => {
-      if (el.__czFadeToken !== token) return;
-      const p = clamp((now - start) / duration, 0, 1);
-      el.volume = clamp(from + (toValue - from) * p, 0, 1);
-      if (p < 1) {
-        requestAnimationFrame(step);
-      } else if (pauseAtEnd && el.pause) {
-        el.pause();
+  function midiToFreq(midi) {
+    return 440 * Math.pow(2, (midi - 69) / 12);
+  }
+  function buildImpulse(seconds = 2.6, decay = 2.3) {
+    const length = Math.max(1, Math.floor(audioContext.sampleRate * seconds));
+    const impulse = audioContext.createBuffer(2, length, audioContext.sampleRate);
+    for (let channel = 0; channel < 2; channel += 1) {
+      const data = impulse.getChannelData(channel);
+      for (let i = 0; i < length; i += 1) {
+        data[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / length, decay);
       }
-    };
-    requestAnimationFrame(step);
-  }
-  function makeTrack(name) {
-    if (tracks[name]) return tracks[name];
-    if (typeof window.Audio !== 'function') {
-      status[name] = 'missing';
-      return null;
     }
-    const el = new window.Audio();
-    el.preload = 'metadata';
-    el.loop = true;
-    el.volume = 0;
-    el.src = AUDIO_TRACK_PATHS[name];
-    status[name] = 'loading';
-    el.addEventListener('loadeddata', () => {
-      status[name] = 'ready';
-      notify();
-    });
-    el.addEventListener('canplay', () => {
-      status[name] = 'ready';
-      notify();
-    });
-    el.addEventListener('playing', () => {
-      status[name] = 'ready';
-      notify();
-    });
-    el.addEventListener('error', () => {
-      status[name] = 'missing';
-      if (current === el) {
-        current = null;
-        currentName = 'none';
-      }
-      notify();
-    });
-    try { el.load(); } catch (error) { /* ignore */ }
-    tracks[name] = el;
-    return el;
+    return impulse;
   }
-  function probeTracks() {
-    makeTrack('journey');
-    makeTrack('finale');
-    notify();
-  }
-  function playScene(name) {
-    if (!settings.musicEnabled || !unlocked || !name || name === 'none') return;
-    const next = makeTrack(name);
-    if (!next) return;
-    pausedByVisibility = false;
-    if (current && current !== next) {
-      fade(current, 0, 700, true);
-    }
-    if (current === next) {
-      if (next.paused) {
-        const promise = next.play();
-        if (promise && promise.catch) promise.catch(() => { status[name] = 'missing'; notify(); });
-      }
-      fade(next, targetMusicVolume(), 280, false);
-      return;
-    }
-    current = next;
-    currentName = name;
-    next.volume = 0;
-    const promise = next.play();
-    if (promise && promise.catch) {
-      promise.catch(() => {
-        status[name] = 'missing';
-        if (current === next) {
-          current = null;
-          currentName = 'none';
-        }
-        notify();
-      });
-    }
-    fade(next, targetMusicVolume(), 1200, false);
-  }
-  function setScene(name) {
-    scene = name || 'none';
-    if (unlocked && settings.musicEnabled && scene !== 'none') {
-      playScene(scene);
-    } else if (scene === 'none' && current) {
-      fade(current, 0, 500, true);
-      current = null;
-      currentName = 'none';
-    }
-  }
-  function initSfx() {
+  function ensureAudioGraph() {
     if (audioContext) return audioContext;
     const AC = window.AudioContext || window.webkitAudioContext;
     if (!AC) return null;
@@ -5282,15 +5188,280 @@ const CZAudio = (() => {
       sfxBus = audioContext.createGain();
       sfxBus.gain.value = settings.sfxVolume * 0.72;
       sfxBus.connect(audioContext.destination);
+      musicMaster = audioContext.createGain();
+      musicMaster.gain.value = targetMusicVolume();
+      musicMaster.connect(audioContext.destination);
+      reverb = audioContext.createConvolver();
+      reverb.buffer = buildImpulse();
+      reverb.connect(musicMaster);
     } catch (error) {
       audioContext = null;
       sfxBus = null;
+      musicMaster = null;
+      reverb = null;
     }
     return audioContext;
   }
+  function syncMusicGain() {
+    if (!audioContext || !musicMaster) return;
+    const now = audioContext.currentTime;
+    musicMaster.gain.cancelScheduledValues(now);
+    musicMaster.gain.setTargetAtTime(targetMusicVolume(), now, 0.12);
+  }
+  function stopProcedural(fadeSeconds = 0.8) {
+    const old = proc;
+    proc = null;
+    if (!old) return;
+    old.stopped = true;
+    window.clearTimeout(old.timer);
+    if (!audioContext) return;
+    const now = audioContext.currentTime;
+    [old.dry, old.wet].forEach((gainNode) => {
+      if (!gainNode) return;
+      const currentValue = Math.max(0.0001, gainNode.gain.value);
+      gainNode.gain.cancelScheduledValues(now);
+      gainNode.gain.setValueAtTime(currentValue, now);
+      gainNode.gain.exponentialRampToValueAtTime(0.0001, now + fadeSeconds);
+    });
+    window.setTimeout(() => {
+      try { old.dry.disconnect(); } catch (error) { /* ignore */ }
+      try { old.wet.disconnect(); } catch (error) { /* ignore */ }
+    }, (fadeSeconds + 0.35) * 1000);
+  }
+  function voiceOut(procRef) {
+    const out = audioContext.createGain();
+    out.gain.value = 1;
+    out.connect(procRef.dry);
+    out.connect(procRef.wet);
+    return out;
+  }
+  function pluck(procRef, midi, when, duration, volume = 0.018) {
+    if (!audioContext || !procRef || procRef.stopped) return;
+    const freq = midiToFreq(midi);
+    const amp = audioContext.createGain();
+    const filter = audioContext.createBiquadFilter();
+    filter.type = 'lowpass';
+    filter.Q.value = 0.7;
+    filter.frequency.setValueAtTime(2600, when);
+    filter.frequency.exponentialRampToValueAtTime(620, when + Math.max(0.35, duration * 0.8));
+    amp.gain.setValueAtTime(0.0001, when);
+    amp.gain.exponentialRampToValueAtTime(Math.max(0.0002, volume), when + 0.012);
+    amp.gain.exponentialRampToValueAtTime(0.0001, when + duration);
+    filter.connect(amp);
+    const out = voiceOut(procRef);
+    amp.connect(out);
+    const oscA = audioContext.createOscillator();
+    const oscB = audioContext.createOscillator();
+    oscA.type = 'triangle';
+    oscB.type = 'sine';
+    oscA.frequency.value = freq;
+    oscB.frequency.value = freq * 2.002;
+    oscB.detune.value = 4;
+    const oscBLevel = audioContext.createGain();
+    oscBLevel.gain.value = 0.35;
+    oscA.connect(filter);
+    oscB.connect(oscBLevel);
+    oscBLevel.connect(filter);
+    oscA.start(when);
+    oscB.start(when);
+    oscA.stop(when + duration + 0.08);
+    oscB.stop(when + duration + 0.08);
+  }
+  function pad(procRef, midi, when, duration, volume = 0.012) {
+    if (!audioContext || !procRef || procRef.stopped) return;
+    const freq = midiToFreq(midi);
+    const amp = audioContext.createGain();
+    const filter = audioContext.createBiquadFilter();
+    filter.type = 'lowpass';
+    filter.Q.value = 0.6;
+    filter.frequency.setValueAtTime(540, when);
+    filter.frequency.linearRampToValueAtTime(320, when + duration);
+    amp.gain.setValueAtTime(0.0001, when);
+    amp.gain.linearRampToValueAtTime(Math.max(0.0002, volume), when + Math.min(1.8, duration * 0.22));
+    amp.gain.setValueAtTime(Math.max(0.0002, volume), when + Math.max(1.9, duration - 1.8));
+    amp.gain.exponentialRampToValueAtTime(0.0001, when + duration);
+    filter.connect(amp);
+    const out = voiceOut(procRef);
+    amp.connect(out);
+    const oscA = audioContext.createOscillator();
+    const oscB = audioContext.createOscillator();
+    oscA.type = 'sawtooth';
+    oscB.type = 'sawtooth';
+    oscA.frequency.value = freq;
+    oscB.frequency.value = freq;
+    oscA.detune.value = -4;
+    oscB.detune.value = 4;
+    const gainA = audioContext.createGain();
+    const gainB = audioContext.createGain();
+    gainA.gain.value = 0.5;
+    gainB.gain.value = 0.5;
+    oscA.connect(gainA);
+    oscB.connect(gainB);
+    gainA.connect(filter);
+    gainB.connect(filter);
+    oscA.start(when);
+    oscB.start(when);
+    oscA.stop(when + duration + 0.3);
+    oscB.stop(when + duration + 0.3);
+  }
+  function bell(procRef, midi, when, duration, volume = 0.005) {
+    if (!audioContext || !procRef || procRef.stopped) return;
+    const freq = midiToFreq(midi);
+    const out = voiceOut(procRef);
+    const amp = audioContext.createGain();
+    amp.gain.setValueAtTime(0.0001, when);
+    amp.gain.exponentialRampToValueAtTime(Math.max(0.0002, volume), when + 0.012);
+    amp.gain.exponentialRampToValueAtTime(0.0001, when + duration);
+    amp.connect(out);
+    [1, 2.01, 3.92].forEach((ratio, index) => {
+      const osc = audioContext.createOscillator();
+      const gain = audioContext.createGain();
+      osc.type = 'sine';
+      osc.frequency.value = freq * ratio;
+      gain.gain.value = [1, 0.35, 0.16][index];
+      osc.connect(gain);
+      gain.connect(amp);
+      osc.start(when);
+      osc.stop(when + duration + 0.1);
+    });
+  }
+  function drum(procRef, when, volume = 0.025) {
+    if (!audioContext || !procRef || procRef.stopped) return;
+    const out = voiceOut(procRef);
+    const osc = audioContext.createOscillator();
+    const amp = audioContext.createGain();
+    osc.type = 'sine';
+    osc.frequency.setValueAtTime(92, when);
+    osc.frequency.exponentialRampToValueAtTime(42, when + 0.35);
+    amp.gain.setValueAtTime(0.0001, when);
+    amp.gain.exponentialRampToValueAtTime(Math.max(0.0002, volume), when + 0.008);
+    amp.gain.exponentialRampToValueAtTime(0.0001, when + 0.48);
+    osc.connect(amp);
+    amp.connect(out);
+    osc.start(when);
+    osc.stop(when + 0.52);
+    const noiseLength = Math.floor(audioContext.sampleRate * 0.18);
+    const buffer = audioContext.createBuffer(1, noiseLength, audioContext.sampleRate);
+    const data = buffer.getChannelData(0);
+    for (let i = 0; i < noiseLength; i += 1) data[i] = (Math.random() * 2 - 1) * (1 - i / noiseLength);
+    const source = audioContext.createBufferSource();
+    source.buffer = buffer;
+    const filter = audioContext.createBiquadFilter();
+    filter.type = 'lowpass';
+    filter.frequency.value = 220;
+    const noiseAmp = audioContext.createGain();
+    noiseAmp.gain.setValueAtTime(0.0001, when);
+    noiseAmp.gain.exponentialRampToValueAtTime(0.01, when + 0.006);
+    noiseAmp.gain.exponentialRampToValueAtTime(0.0001, when + 0.17);
+    source.connect(filter);
+    filter.connect(noiseAmp);
+    noiseAmp.connect(out);
+    source.start(when);
+  }
+  function scheduleJourney(procRef, startAt, loopIndex) {
+    const beat = 0.95;
+    const loopSeconds = 32 * beat;
+    pad(procRef, 38, startAt, loopSeconds, 0.0105);
+    pad(procRef, 45, startAt + 0.25, loopSeconds - 0.5, 0.0065);
+    const melody = [
+      [0, 62, 4, 0.017], [2.5, 57, 3, 0.013], [4, 65, 4, 0.016], [7, 60, 3, 0.013],
+      [8, 62, 5, 0.016], [10.5, 57, 3, 0.012], [12, 55, 4, 0.015], [15, 57, 3, 0.012],
+      [16, 62, 4, 0.016], [18.5, 65, 4, 0.014], [20, 60, 4, 0.013], [23, 57, 4, 0.012],
+      [24, 55, 4, 0.014], [26.5, 53, 4, 0.013], [28, 50, 5, 0.015], [30, 57, 3, 0.012]
+    ];
+    melody.forEach(([beatPos, midi, beats, volume], index) => {
+      pluck(procRef, midi, startAt + beatPos * beat, beats * beat, volume);
+      if (index % 4 === 0) {
+        pluck(procRef, midi - 12, startAt + beatPos * beat, beats * beat, 0.0065);
+      }
+    });
+    [0, 4, 8, 12, 16, 20, 24, 28].forEach((beatPos, index) => {
+      drum(procRef, startAt + beatPos * beat, index % 2 === 0 ? 0.021 : 0.012);
+    });
+    [7.5, 15.5, 23.5].forEach((beatPos, index) => {
+      bell(procRef, [74, 81, 69][index], startAt + beatPos * beat, 4.5, 0.0045);
+    });
+    if (loopIndex % 2 === 1) {
+      pluck(procRef, 69, startAt + 14 * beat, 4, 0.008);
+      pluck(procRef, 72, startAt + 29 * beat, 4, 0.0065);
+    }
+    return loopSeconds;
+  }
+  function scheduleFinale(procRef, startAt, loopIndex) {
+    const beat = 1.25;
+    const loopSeconds = 32 * beat;
+    pad(procRef, 38, startAt, loopSeconds, 0.0125);
+    pad(procRef, 45, startAt + 0.4, loopSeconds - 0.8, 0.0072);
+    const lowStrings = [
+      [0, 50, 8, 0.0075], [8, 53, 8, 0.0068], [16, 48, 8, 0.0072], [24, 46, 8, 0.0065]
+    ];
+    lowStrings.forEach(([beatPos, midi, beats, volume]) => {
+      pad(procRef, midi, startAt + beatPos * beat, beats * beat, volume);
+    });
+    const piano = [
+      [2, 62, 5, 0.010], [6, 65, 4, 0.008], [10, 60, 6, 0.010], [14, 58, 5, 0.008],
+      [18, 57, 6, 0.009], [22, 60, 5, 0.008], [26, 62, 5, 0.009], [30, 57, 8, 0.008]
+    ];
+    piano.forEach(([beatPos, midi, beats, volume]) => {
+      pluck(procRef, midi, startAt + beatPos * beat, beats * beat, volume);
+    });
+    bell(procRef, 69, startAt, 8, 0.0042);
+    bell(procRef, 62, startAt + 20 * beat, 9, 0.0035);
+    if (loopIndex % 2 === 1) {
+      pad(procRef, 41, startAt + 12 * beat, 8 * beat, 0.006);
+      pluck(procRef, 53, startAt + 24 * beat, 7 * beat, 0.007);
+    }
+    return loopSeconds;
+  }
+  function scheduleLoop(procRef, startAt, loopIndex) {
+    if (!procRef || procRef.stopped || !audioContext || !settings.musicEnabled) return;
+    let loopSeconds = 30.4;
+    if (procRef.name === 'journey') loopSeconds = scheduleJourney(procRef, startAt, loopIndex);
+    else loopSeconds = scheduleFinale(procRef, startAt, loopIndex);
+    const delay = Math.max(600, (startAt + loopSeconds - audioContext.currentTime - 2) * 1000);
+    procRef.timer = window.setTimeout(() => {
+      if (proc === procRef && !procRef.stopped) {
+        scheduleLoop(procRef, startAt + loopSeconds, loopIndex + 1);
+      }
+    }, delay);
+  }
+  function startProcedural(name) {
+    if (!settings.musicEnabled || !unlocked || !name || name === 'none') return;
+    if (!ensureAudioGraph()) return;
+    if (proc && proc.name === name && !proc.stopped) {
+      syncMusicGain();
+      return;
+    }
+    stopProcedural(0.8);
+    const dry = audioContext.createGain();
+    const wet = audioContext.createGain();
+    const now = audioContext.currentTime + 0.06;
+    dry.gain.setValueAtTime(0.0001, now);
+    wet.gain.setValueAtTime(0.0001, now);
+    dry.gain.exponentialRampToValueAtTime(0.92, now + 1.6);
+    wet.gain.exponentialRampToValueAtTime(0.32, now + 1.8);
+    dry.connect(musicMaster);
+    wet.connect(reverb);
+    const procRef = { name, dry, wet, timer: 0, stopped: false };
+    proc = procRef;
+    syncMusicGain();
+    scheduleLoop(procRef, now, 0);
+  }
+  function playScene(name) {
+    if (!settings.musicEnabled || !unlocked || !name || name === 'none') return;
+    startProcedural(name);
+  }
+  function setScene(name) {
+    scene = name || 'none';
+    if (!settings.musicEnabled || !unlocked || scene === 'none') {
+      if (scene === 'none' || !settings.musicEnabled) stopProcedural(0.7);
+      return;
+    }
+    playScene(scene);
+  }
   function unlock() {
     if (!unlocked) unlocked = true;
-    initSfx();
+    ensureAudioGraph();
     if (audioContext && audioContext.state === 'suspended') {
       audioContext.resume().catch(() => { /* ignore */ });
     }
@@ -5298,16 +5469,14 @@ const CZAudio = (() => {
     notify();
   }
   function tone(freq, duration, type = 'sine', gain = 0.02, slideTo = null, when = 0) {
-    const ctx = initSfx();
+    const ctx = ensureAudioGraph();
     if (!ctx || !sfxBus || !settings.sfxEnabled) return;
     const t0 = ctx.currentTime + when;
     const osc = ctx.createOscillator();
     const amp = ctx.createGain();
     osc.type = type;
     osc.frequency.setValueAtTime(Math.max(20, freq), t0);
-    if (slideTo) {
-      osc.frequency.exponentialRampToValueAtTime(Math.max(20, slideTo), t0 + duration);
-    }
+    if (slideTo) osc.frequency.exponentialRampToValueAtTime(Math.max(20, slideTo), t0 + duration);
     amp.gain.setValueAtTime(0.0001, t0);
     amp.gain.exponentialRampToValueAtTime(Math.max(0.0002, gain), t0 + 0.008);
     amp.gain.exponentialRampToValueAtTime(0.0001, t0 + duration);
@@ -5317,15 +5486,13 @@ const CZAudio = (() => {
     osc.stop(t0 + duration + 0.04);
   }
   function noise(duration, gain, filterType = 'bandpass', frequency = 900, q = 0.8, when = 0) {
-    const ctx = initSfx();
+    const ctx = ensureAudioGraph();
     if (!ctx || !sfxBus || !settings.sfxEnabled) return;
     const t0 = ctx.currentTime + when;
     const sampleCount = Math.max(1, Math.floor(ctx.sampleRate * duration));
     const buffer = ctx.createBuffer(1, sampleCount, ctx.sampleRate);
     const data = buffer.getChannelData(0);
-    for (let i = 0; i < sampleCount; i += 1) {
-      data[i] = (Math.random() * 2 - 1) * (1 - i / sampleCount);
-    }
+    for (let i = 0; i < sampleCount; i += 1) data[i] = (Math.random() * 2 - 1) * (1 - i / sampleCount);
     const source = ctx.createBufferSource();
     source.buffer = buffer;
     const filter = ctx.createBiquadFilter();
@@ -5388,14 +5555,11 @@ const CZAudio = (() => {
     settings.musicEnabled = Boolean(enabled);
     saveSettings();
     if (!settings.musicEnabled) {
-      if (current) {
-        fade(current, 0, 300, true);
-        current = null;
-        currentName = 'none';
-      }
+      stopProcedural(0.45);
     } else if (unlocked && scene !== 'none') {
       playScene(scene);
     }
+    syncMusicGain();
     notify();
   }
   function setSfxEnabled(enabled) {
@@ -5409,7 +5573,7 @@ const CZAudio = (() => {
   function setMusicVolume(value) {
     settings.musicVolume = clamp(Number(value) || 0, 0, 1);
     saveSettings();
-    if (current && !current.paused) fade(current, targetMusicVolume(), 180, false);
+    syncMusicGain();
     notify();
   }
   function setSfxVolume(value) {
@@ -5422,58 +5586,42 @@ const CZAudio = (() => {
   }
   function setDucked(value) {
     ducked = Boolean(value);
-    if (current && !current.paused) fade(current, targetMusicVolume(), 320, false);
+    syncMusicGain();
   }
   function pauseForVisibility() {
-    if (current && !current.paused) {
-      current.pause();
-      pausedByVisibility = true;
-    }
+    pausedByVisibility = true;
+    if (proc) stopProcedural(0.25);
     if (audioContext && audioContext.state === 'running') {
       audioContext.suspend().catch(() => { /* ignore */ });
     }
   }
   function resumeForVisibility() {
+    if (!pausedByVisibility) return;
+    pausedByVisibility = false;
     if (audioContext && audioContext.state === 'suspended') {
       audioContext.resume().catch(() => { /* ignore */ });
     }
-    if (pausedByVisibility && settings.musicEnabled && scene !== 'none') {
-      pausedByVisibility = false;
-      playScene(scene);
-    }
+    if (settings.musicEnabled && scene !== 'none') playScene(scene);
   }
   function reloadTracks() {
-    Object.keys(tracks).forEach((key) => {
-      const el = tracks[key];
-      try { el.pause(); } catch (error) { /* ignore */ }
-      try {
-        el.removeAttribute('src');
-        el.load();
-      } catch (error) { /* ignore */ }
-      delete tracks[key];
-      status[key] = 'idle';
-    });
-    current = null;
-    currentName = 'none';
-    probeTracks();
-    if (unlocked && settings.musicEnabled && scene !== 'none') {
-      window.setTimeout(() => playScene(scene), 120);
-    }
+    stopProcedural(0.2);
+    if (settings.musicEnabled && scene !== 'none' && unlocked) playScene(scene);
+    notify();
+  }
+  function probeTracks() {
+    ensureAudioGraph();
     notify();
   }
   function getState() {
     return {
       settings: { ...settings },
-      status: { ...status },
-      paths: { ...AUDIO_TRACK_PATHS },
+      mode: 'synth',
+      scene,
+      unlocked,
       credits: {
         journey: { ...MUSIC_CREDITS.journey },
         finale: { ...MUSIC_CREDITS.finale }
-      },
-      statusLabels: { ...statusLabels },
-      scene,
-      currentName,
-      unlocked
+      }
     };
   }
   return {
@@ -5494,9 +5642,6 @@ const CZAudio = (() => {
     previewSfx: () => sfx('collect')
   };
 })();
-function audioStatusLabel(value) {
-  return CZAudio.getState().statusLabels[value] || value;
-}
 function audioButtonState() {
   const settings = CZAudio.getState().settings;
   const enabled = settings.musicEnabled || settings.sfxEnabled;
@@ -5504,16 +5649,12 @@ function audioButtonState() {
     const use = D.audioBtn.querySelector('use');
     if (use) use.setAttribute('href', enabled ? '#i-sound' : '#i-mute');
     D.audioBtn.classList.toggle('muted', !enabled);
-    D.audioBtn.title = enabled ? '声音设置 · 已开启' : '声音设置 · 已静音';
+    D.audioBtn.title = enabled ? '声音设置 · 内置合成音乐' : '声音设置 · 已静音';
   }
 }
 function refreshAudioSettingsPanel() {
   if (!ui.modalOpen) return;
-  const box = document.getElementById('audioStatusBox');
-  if (!box) return;
   const info = CZAudio.getState();
-  const statusLine = (name, label) => `<div class="audio-track"><b>${label}</b><span class="audio-state ${info.status[name]}">${audioStatusLabel(info.status[name])}</span><code>${escapeHTML(info.paths[name])}</code></div>`;
-  box.innerHTML = statusLine('journey', '游戏过程 · 轻量背景音乐') + statusLine('finale', '结尾 · 沉默而悲壮');
   const musicToggle = document.getElementById('audioMusicToggle');
   const sfxToggle = document.getElementById('audioSfxToggle');
   if (musicToggle) musicToggle.checked = info.settings.musicEnabled;
@@ -5526,38 +5667,41 @@ function refreshAudioSettingsPanel() {
   const sfxOut = document.getElementById('audioSfxOut');
   if (musicOut) musicOut.textContent = `${Math.round(info.settings.musicVolume * 100)}%`;
   if (sfxOut) sfxOut.textContent = `${Math.round(info.settings.sfxVolume * 100)}%`;
-  const credits = document.getElementById('audioCredits');
-  if (credits) {
-    credits.innerHTML = `<b>音乐署名占位</b><br>游戏过程：${escapeHTML(info.credits.journey.title)} · ${escapeHTML(info.credits.journey.credit)}<br>结 尾：${escapeHTML(info.credits.finale.title)} · ${escapeHTML(info.credits.finale.credit)}`;
+  const sceneLabel = document.getElementById('audioSceneLabel');
+  if (sceneLabel) {
+    sceneLabel.textContent = info.scene === 'finale' ? '结尾 · 会宁之后' : info.scene === 'journey' ? '行军途中' : '未开始';
   }
 }
 function openAudioSettings() {
   CZAudio.unlock();
   CZAudio.probeTracks();
   const info = CZAudio.getState();
-  const statusLine = (name, label) => `<div class="audio-track"><b>${label}</b><span class="audio-state ${info.status[name]}">${audioStatusLabel(info.status[name])}</span><code>${escapeHTML(info.paths[name])}</code></div>`;
   openModal({
-    kicker: 'SOUND & MUSIC · 声音设计',
+    kicker: 'SOUND & MUSIC · 内置声音设计',
     title: '声音设置',
     body: `<div class="audio-panel">
-      <p class="audio-lead">音效由浏览器实时合成，不依赖素材文件；两首背景音乐从仓库内的本地文件读取。浏览器通常要等你点击“开始推演”后才允许播放声音。</p>
+      <p class="audio-lead">两首背景音乐和全部音效都由 Web Audio 实时合成，不需要下载任何音乐素材，也不会向外部服务器请求音频。浏览器通常要等你点击“开始推演”后才允许播放声音。</p>
       <div class="audio-setting">
-        <div class="audio-copy"><b>背景音乐</b><p>游戏过程使用轻量氛围音乐，进入会宁终章后切换到沉默而悲壮的第二首。</p></div>
+        <div class="audio-copy"><b>背景音乐</b><p>游戏过程是轻量的行军氛围；进入会宁终章后切换为更沉默、悲壮的段落。</p></div>
         <label class="audio-switch"><input id="audioMusicToggle" type="checkbox"${info.settings.musicEnabled ? ' checked' : ''} aria-label="开关背景音乐"><span></span></label>
       </div>
       <div class="audio-setting">
-        <div class="audio-copy"><b>交互音效</b><p>木槌、纸张、低鼓、史料入藏提示音，均由 Web Audio 实时生成。</p></div>
+        <div class="audio-copy"><b>交互音效</b><p>纸张、木槌、低鼓、史料入藏提示音，同样由代码实时生成。</p></div>
         <label class="audio-switch"><input id="audioSfxToggle" type="checkbox"${info.settings.sfxEnabled ? ' checked' : ''} aria-label="开关音效"><span></span></label>
       </div>
       <div class="audio-slider-row"><label for="audioMusicRange">音乐音量</label><input id="audioMusicRange" type="range" min="0" max="100" value="${Math.round(info.settings.musicVolume * 100)}"><output id="audioMusicOut">${Math.round(info.settings.musicVolume * 100)}%</output></div>
       <div class="audio-slider-row"><label for="audioSfxRange">音效音量</label><input id="audioSfxRange" type="range" min="0" max="100" value="${Math.round(info.settings.sfxVolume * 100)}"><output id="audioSfxOut">${Math.round(info.settings.sfxVolume * 100)}%</output></div>
-      <div class="audio-status" id="audioStatusBox">${statusLine('journey', '游戏过程 · 轻量背景音乐')}${statusLine('finale', '结尾 · 沉默而悲壮')}</div>
+      <div class="audio-status" id="audioStatusBox">
+        <div class="audio-track"><b>音乐引擎</b><span class="audio-state ready">内置合成</span><code>Web Audio 实时生成 · 无外部文件 · 当前场景：<span id="audioSceneLabel">${info.scene === 'finale' ? '结尾 · 会宁之后' : info.scene === 'journey' ? '行军途中' : '未开始'}</span></code></div>
+        <div class="audio-track"><b>游戏过程</b><span class="audio-state ready">行军氛围</span><code>古筝式拨弦 / 低音持续音 / 轻军鼓</code></div>
+        <div class="audio-track"><b>结尾</b><span class="audio-state ready">沉静悲壮</span><code>低音弦乐 / 稀疏钢琴 / 远处钟声</code></div>
+      </div>
       <div class="audio-actions">
         <button id="audioPreview" type="button">试听音效</button>
-        <button id="audioReload" type="button">重新加载音乐</button>
+        <button id="audioReload" type="button">重新开始音乐</button>
       </div>
-      <p class="audio-note"><b>素材放置：</b>把两首音乐分别命名为 <code>bgm-journey.mp3</code> 与 <code>bgm-finale.mp3</code>，放进仓库的 <code>assets/audio/</code> 目录。文件缺失不会影响游戏运行，只会静音。</p>
-      <p class="audio-credit" id="audioCredits"><b>音乐署名占位</b><br>游戏过程：${escapeHTML(info.credits.journey.title)} · ${escapeHTML(info.credits.journey.credit)}<br>结 尾：${escapeHTML(info.credits.finale.title)} · ${escapeHTML(info.credits.finale.credit)}</p>
+      <p class="audio-note"><b>无需素材：</b>本版本没有外部音频文件，也没有外部音频请求。两首乐曲由程序在和弦、节奏与音色参数上实时生成。</p>
+      <p class="audio-credit"><b>声音设计：</b>程序化配乐与合成音效，无第三方音乐版权依赖。<br>游戏过程：${escapeHTML(info.credits.journey.title)} · ${escapeHTML(info.credits.journey.credit)}<br>结 尾：${escapeHTML(info.credits.finale.title)} · ${escapeHTML(info.credits.finale.credit)}</p>
     </div>`,
     buttons: [{ label: '完成', variant: 'primary' }],
     after: () => {
@@ -5582,9 +5726,10 @@ function openAudioSettings() {
       const reload = document.getElementById('audioReload');
       if (reload) reload.addEventListener('click', () => {
         CZAudio.reloadTracks();
-        window.setTimeout(refreshAudioSettingsPanel, 350);
-        showToast('正在重新加载背景音乐文件…');
+        window.setTimeout(refreshAudioSettingsPanel, 60);
+        showToast('内置合成音乐已重新开始');
       });
+      window.setTimeout(refreshAudioSettingsPanel, 30);
     }
   });
 }
